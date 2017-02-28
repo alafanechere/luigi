@@ -22,20 +22,20 @@ system operations. The `boto` library is required to use S3 targets.
 
 from __future__ import division
 
-import datetime
-import itertools
 import logging
 import os
 import os.path
 
 import time
-from multiprocessing.pool import ThreadPool
+import tempfile
+import io
+
 
 try:
     from urlparse import urlsplit
 except ImportError:
     from urllib.parse import urlsplit
-import warnings
+import random
 
 try:
     from ConfigParser import NoSectionError
@@ -43,22 +43,13 @@ except ImportError:
     from configparser import NoSectionError
 
 from luigi import six
-from luigi.six.moves import range
 
 from luigi import configuration
-from luigi.format import get_default_format
-from luigi.parameter import Parameter
-from luigi.target import FileAlreadyExists, FileSystem, FileSystemException, FileSystemTarget, AtomicLocalFile, \
-    MissingParentDirectory
-from luigi.task import ExternalTask
+from luigi.format import FileWrapper, get_default_format
+
+from luigi.target import FileSystem, FileSystemException, FileSystemTarget, AtomicLocalFile
 
 logger = logging.getLogger('luigi-interface')
-
-# two different ways of marking a directory
-# with a suffix in S3
-S3_DIRECTORY_MARKER_SUFFIX_0 = '_$folder$'
-S3_DIRECTORY_MARKER_SUFFIX_1 = '/'
-
 
 class InvalidDeleteException(FileSystemException):
     pass
@@ -170,7 +161,7 @@ class AzureStorageClient(FileSystem):
 
     def get(self, azure_path, destination_local_path):
         """
-        Get an object stored in S3 and write it to a local path.
+        Get an object stored in Azure and write it to a local path.
         """
         (container, blob_name) = self._path_to_container_and_blob(azure_path)
 
@@ -178,8 +169,10 @@ class AzureStorageClient(FileSystem):
             logger.warn('Container %s does not exist', container)
             return False
 
-        # download the file
-        self.block_blob_service.get_blob_to_path(container, blob_name, destination_local_path)
+        if self.block_blob_service.exists(container, blob_name):
+            self.block_blob_service.get_blob_to_path(container, blob_name, destination_local_path)
+        else:
+            raise FileNotFoundException
 
     def get_as_string(self, azure_path):
         """
@@ -191,7 +184,27 @@ class AzureStorageClient(FileSystem):
             logger.warn('Container %s does not exist', container)
             return False
 
-        return self.block_blob_service.get_blob_to_text(container, blob_name).content
+        if self.block_blob_service.exists(container, blob_name):
+            return self.block_blob_service.get_blob_to_text(container, blob_name).content
+        else:
+            raise FileNotFoundException
+
+    def get_as_bytes(self, azure_path):
+        """
+        Get an object stored in S3 and write it to a local path.
+        """
+        (container, blob_name) = self._path_to_container_and_blob(azure_path)
+
+        if not self.block_blob_service.exists(container):
+            logger.warn('Container %s does not exist', container)
+            return False
+
+        # download the file
+        if self.block_blob_service.exists(container, blob_name):
+            return self.block_blob_service.get_blob_to_bytes(container, blob_name).content
+        else:
+            raise FileNotFoundException
+
 
     def copy(self, source_path, destination_path):
         """
@@ -270,220 +283,77 @@ class AzureStorageClient(FileSystem):
         return key if key[-1:] == '/' or key == '' else key + '/'
 
 
-class AtomicS3File(AtomicLocalFile):
+class AtomicAzureFile(AtomicLocalFile):
     """
-    An S3 file that writes to a temp file and puts to S3 on close.
+    Simple class that writes to a temp file and upload to Azure Storage on close().
 
-    :param kwargs: Keyword arguments are passed to the boto function `initiate_multipart_upload`
+    Also cleans up the temp file if close is not invoked.
     """
 
-    def __init__(self, path, s3_client, **kwargs):
-        self.s3_client = s3_client
-        super(AtomicS3File, self).__init__(path)
-        self.s3_options = kwargs
+    def __init__(self, fs, path):
+        """
+        Initializes an AtomicAzureFile instance.
+        :param fs:
+        :param path:
+        :type path: str
+        """
+        self._fs = fs
+        super(AtomicAzureFile, self).__init__(path)
 
     def move_to_final_destination(self):
-        self.s3_client.put_multipart(self.tmp_path, self.path, **self.s3_options)
+        self._fs.put(self.tmp_path, self.path)
+
+    @property
+    def fs(self):
+        return self._fs
 
 
-class ReadableS3File(object):
-    def __init__(self, s3_key):
-        self.s3_key = s3_key
-        self.buffer = []
-        self.closed = False
-        self.finished = False
-
-    def read(self, size=0):
-        f = self.s3_key.read(size=size)
-
-        # boto will loop on the key forever and it's not what is expected by
-        # the python io interface
-        # boto/boto#2805
-        if f == b'':
-            self.finished = True
-        if self.finished:
-            return b''
-
-        return f
-
-    def close(self):
-        self.s3_key.close()
-        self.closed = True
-
-    def __del__(self):
-        self.close()
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.close()
-
-    def __enter__(self):
-        return self
-
-    def _add_to_buffer(self, line):
-        self.buffer.append(line)
-
-    def _flush_buffer(self):
-        output = b''.join(self.buffer)
-        self.buffer = []
-        return output
-
-    def readable(self):
-        return True
-
-    def writable(self):
-        return False
-
-    def seekable(self):
-        return False
-
-    def __iter__(self):
-        key_iter = self.s3_key.__iter__()
-
-        has_next = True
-        while has_next:
-            try:
-                # grab the next chunk
-                chunk = next(key_iter)
-
-                # split on newlines, preserving the newline
-                for line in chunk.splitlines(True):
-
-                    if not line.endswith(os.linesep):
-                        # no newline, so store in buffer
-                        self._add_to_buffer(line)
-                    else:
-                        # newline found, send it out
-                        if self.buffer:
-                            self._add_to_buffer(line)
-                            yield self._flush_buffer()
-                        else:
-                            yield line
-            except StopIteration:
-                # send out anything we have left in the buffer
-                output = self._flush_buffer()
-                if output:
-                    yield output
-                has_next = False
-        self.close()
-
-
-class S3Target(FileSystemTarget):
+class AzureStorageTarget(FileSystemTarget):
     """
-    Target S3 file object
-
-    :param kwargs: Keyword arguments are passed to the boto function `initiate_multipart_upload`
+    Target Azure storage blob object
     """
 
     fs = None
 
-    def __init__(self, path, format=None, client=None, **kwargs):
-        super(S3Target, self).__init__(path)
+    def __init__(self, path, format=None, client=None,):
+        super(AzureStorageTarget, self).__init__(path)
         if format is None:
             format = get_default_format()
 
         self.path = path
         self.format = format
-        self.fs = client or S3Client()
-        self.s3_options = kwargs
+        self.fs = client or AzureStorageClient()
 
     def open(self, mode='r'):
-        if mode not in ('r', 'w'):
-            raise ValueError("Unsupported open mode '%s'" % mode)
+        """
+        Open the FileSystem target.
+
+        This method returns a file-like object which can either be read from or written to depending
+        on the specified mode.
+
+        :param mode: the mode `r` opens the FileSystemTarget in read-only mode, whereas `w` will
+                     open the FileSystemTarget in write mode. Subclasses can implement
+                     additional options.
+        :type mode: str
+        """
+        if mode == 'w':
+            return self.format.pipe_writer(AtomicAzureFile(self.fs, self.path))
 
         if mode == 'r':
-            s3_key = self.fs.get_key(self.path)
-            if not s3_key:
-                raise FileNotFoundException("Could not find file at %s" % self.path)
+            temp_dir = os.path.join(tempfile.gettempdir(), 'luigi-contrib-azure')
 
-            fileobj = ReadableS3File(s3_key)
-            return self.format.pipe_reader(fileobj)
+            try:
+                os.mkdir(temp_dir)
+            except OSError:
+                pass
+
+            self.__tmp_path = temp_dir + '/' + self.path.split('/')[0] + '-luigi-tmp-%09d' % random.randrange(0, 1e10)
+            self.fs.get(self.path, self.__tmp_path)
+
+            return self.format.pipe_reader(
+                FileWrapper(io.BufferedReader(io.FileIO(self.__tmp_path, 'r')))
+            )
         else:
-            return self.format.pipe_writer(AtomicS3File(self.path, self.fs, **self.s3_options))
+            raise Exception("mode must be 'r' or 'w' (got: %s)" % mode)
 
 
-class S3FlagTarget(S3Target):
-    """
-    Defines a target directory with a flag-file (defaults to `_SUCCESS`) used
-    to signify job success.
-
-    This checks for two things:
-
-    * the path exists (just like the S3Target)
-    * the _SUCCESS file exists within the directory.
-
-    Because Hadoop outputs into a directory and not a single file,
-    the path is assumed to be a directory.
-
-    This is meant to be a handy alternative to AtomicS3File.
-
-    The AtomicFile approach can be burdensome for S3 since there are no directories, per se.
-
-    If we have 1,000,000 output files, then we have to rename 1,000,000 objects.
-    """
-
-    fs = None
-
-    def __init__(self, path, format=None, client=None, flag='_SUCCESS'):
-        """
-        Initializes a S3FlagTarget.
-
-        :param path: the directory where the files are stored.
-        :type path: str
-        :param client:
-        :type client:
-        :param flag:
-        :type flag: str
-        """
-        if format is None:
-            format = get_default_format()
-
-        if path[-1] != "/":
-            raise ValueError("S3FlagTarget requires the path to be to a "
-                             "directory.  It must end with a slash ( / ).")
-        super(S3FlagTarget, self).__init__(path, format, client)
-        self.flag = flag
-
-    def exists(self):
-        hadoopSemaphore = self.path + self.flag
-        return self.fs.exists(hadoopSemaphore)
-
-
-class S3EmrTarget(S3FlagTarget):
-    """
-    Deprecated. Use :py:class:`S3FlagTarget`
-    """
-
-    def __init__(self, *args, **kwargs):
-        warnings.warn("S3EmrTarget is deprecated. Please use S3FlagTarget")
-        super(S3EmrTarget, self).__init__(*args, **kwargs)
-
-
-class S3PathTask(ExternalTask):
-    """
-    A external task that to require existence of a path in S3.
-    """
-    path = Parameter()
-
-    def output(self):
-        return S3Target(self.path)
-
-
-class S3EmrTask(ExternalTask):
-    """
-    An external task that requires the existence of EMR output in S3.
-    """
-    path = Parameter()
-
-    def output(self):
-        return S3EmrTarget(self.path)
-
-
-class S3FlagTask(ExternalTask):
-    """
-    An external task that requires the existence of EMR output in S3.
-    """
-    path = Parameter()
-    flag = Parameter(default=None)
-
-    def output(self):
-        return S3FlagTarget(self.path, flag=self.flag)

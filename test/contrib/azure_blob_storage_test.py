@@ -24,87 +24,42 @@ from target_test import FileSystemTargetTestMixin
 from helpers import with_config, unittest, skipOnTravis
 
 from luigi import configuration
-from luigi.target import MissingParentDirectory
-from luigi.contrib.azure_storage import AzureStorageClient
+from luigi.target import FileSystemException
+from luigi.contrib.azure_storage import AzureStorageClient, AzureStorageTarget
 
 STORAGE_ACCOUNT = os.environ['STORAGE_ACCOUNT']
 STORAGE_ACCOUNT_KEY = os.environ['STORAGE_ACCOUNT_KEY']
 AZURE_TEST_PATH = 'bibdipdata/dev_tests'
 
-# class TestS3Target(unittest.TestCase, FileSystemTargetTestMixin):
-#
-#     def setUp(self):
-#         f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-#         self.tempFileContents = (
-#             b"I'm a temporary file for testing\nAnd this is the second line\n"
-#             b"This is the third.")
-#         self.tempFilePath = f.name
-#         f.write(self.tempFileContents)
-#         f.close()
-#         self.addCleanup(os.remove, self.tempFilePath)
-#
-#         self.mock_s3 = mock_s3()
-#         self.mock_s3.start()
-#         self.addCleanup(self.mock_s3.stop)
-#
-#     def create_target(self, format=None, **kwargs):
-#         client = S3Client(AWS_ACCESS_KEY, AWS_SECRET_KEY)
-#         client.s3.create_bucket('mybucket')
-#         return S3Target('s3://mybucket/test_file', client=client, format=format, **kwargs)
-#
-#     def test_read(self):
-#         client = S3Client(AWS_ACCESS_KEY, AWS_SECRET_KEY)
-#         client.s3.create_bucket('mybucket')
-#         client.put(self.tempFilePath, 's3://mybucket/tempfile')
-#         t = S3Target('s3://mybucket/tempfile', client=client)
-#         read_file = t.open()
-#         file_str = read_file.read()
-#         self.assertEqual(self.tempFileContents, file_str.encode('utf-8'))
-#
-#     def test_read_no_file(self):
-#         t = self.create_target()
-#         self.assertRaises(FileNotFoundException, t.open)
-#
-#     def test_read_no_file_sse(self):
-#         t = self.create_target(encrypt_key=True)
-#         self.assertRaises(FileNotFoundException, t.open)
-#
-#     def test_read_iterator_long(self):
-#         # write a file that is 5X the boto buffersize
-#         # to test line buffering
-#         old_buffer = key.Key.BufferSize
-#         key.Key.BufferSize = 2
-#         try:
-#             tempf = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-#             temppath = tempf.name
-#             firstline = ''.zfill(key.Key.BufferSize * 5) + os.linesep
-#             contents = firstline + 'line two' + os.linesep + 'line three'
-#             tempf.write(contents.encode('utf-8'))
-#             tempf.close()
-#
-#             client = S3Client(AWS_ACCESS_KEY, AWS_SECRET_KEY)
-#             client.s3.create_bucket('mybucket')
-#             client.put(temppath, 's3://mybucket/largetempfile')
-#             t = S3Target('s3://mybucket/largetempfile', client=client)
-#             with t.open() as read_file:
-#                 lines = [line for line in read_file]
-#         finally:
-#             key.Key.BufferSize = old_buffer
-#
-#         self.assertEqual(3, len(lines))
-#         self.assertEqual(firstline, lines[0])
-#         self.assertEqual("line two" + os.linesep, lines[1])
-#         self.assertEqual("line three", lines[2])
-#
-#     def test_get_path(self):
-#         t = self.create_target()
-#         path = t.path
-#         self.assertEqual('s3://mybucket/test_file', path)
-#
-#     def test_get_path_sse(self):
-#         t = self.create_target(encrypt_key=True)
-#         path = t.path
-#         self.assertEqual('s3://mybucket/test_file', path)
+
+class TestAzureTarget(unittest.TestCase, FileSystemTargetTestMixin):
+
+    def setUp(self):
+        f = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+        self.tempFileContents = (
+            b"I'm a temporary file for testing\nAnd this is the second line\n"
+            b"This is the third.")
+        self.tempFilePath = f.name
+        f.write(self.tempFileContents)
+        f.close()
+        self.addCleanup(os.remove, self.tempFilePath)
+
+    def create_target(self, format=None, path='bibdipdata/dev_tests/tempfile'):
+        client = AzureStorageClient(STORAGE_ACCOUNT, STORAGE_ACCOUNT_KEY)
+        return AzureStorageTarget(path, client=client, format=format)
+
+    def test_read(self):
+        client = AzureStorageClient(STORAGE_ACCOUNT, STORAGE_ACCOUNT_KEY)
+        client.put(self.tempFilePath, 'bibdipdata/dev_tests/tempfile')
+        t = AzureStorageTarget('bibdipdata/dev_tests/tempfile', client=client)
+        read_file = t.open('r')
+        file_str = read_file.read()
+        self.assertEqual(self.tempFileContents, file_str.encode('utf-8'))
+
+    def test_get_path(self):
+        t = self.create_target()
+        path = t.path
+        self.assertEqual('bibdipdata/dev_tests/tempfile', path)
 
 
 class TestAzureStorageClient(unittest.TestCase):
@@ -165,7 +120,7 @@ class TestAzureStorageClient(unittest.TestCase):
 
 
     def test_get(self):
-        # put a file on s3 first
+        # put a file on Azure first
         azure_storage_client = AzureStorageClient(STORAGE_ACCOUNT, STORAGE_ACCOUNT_KEY)
         azure_storage_client.put(self.tempFilePath, AZURE_TEST_PATH + '/tempfile')
 
@@ -185,6 +140,15 @@ class TestAzureStorageClient(unittest.TestCase):
         contents = azure_storage_client.get_as_string(AZURE_TEST_PATH + '/tempfile')
 
         self.assertEquals(contents, self.tempFileContentsStr)
+
+    def test_get_as_bytes(self):
+        # put a file on s3 first
+        azure_storage_client = AzureStorageClient(STORAGE_ACCOUNT, STORAGE_ACCOUNT_KEY)
+        azure_storage_client.put(self.tempFilePath, AZURE_TEST_PATH + '/tempfile')
+
+        contents = azure_storage_client.get_as_bytes(AZURE_TEST_PATH + '/tempfile')
+
+        self.assertEquals(contents, self.tempFileContentsStr.encode())
 
     def test_remove(self):
         azure_storage_client = AzureStorageClient(STORAGE_ACCOUNT, STORAGE_ACCOUNT_KEY)
